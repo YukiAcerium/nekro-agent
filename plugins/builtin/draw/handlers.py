@@ -266,6 +266,94 @@ async def generate_image_api(
     )
 
 
+def _image_item_to_data_uri(item: Any) -> Optional[str]:
+    """将单个图片项转换为完整的 data URI。
+
+    provider 可能返回多种结构：
+      - `{"data": "<base64>"}` 或 `{"b64_json": "<base64>"}`
+      - `{"image_url": {"url": "data:image/jpeg;base64,<b64>"}}` 或 `{"image_url": "data:...;base64,<b64>"}`
+      - 纯 base64 字符串 / 已带 data: 前缀的字符串 / 普通 http(s) URL
+    返回完整的 `data:<mime>;base64,<b64>`；若原样未带前缀则默认按 image/png 补齐；普通 URL 原样返回。
+    """
+    b64: Optional[str] = None
+    mime = "image/png"
+    raw_url: Optional[str] = None
+
+    if isinstance(item, str):
+        if item.startswith("data:") and "base64," in item:
+            head, _, rest = item.partition("base64,")
+            mime = head[5:].split(";")[0] or "image/png"
+            b64 = rest.strip()
+        elif "://" in item:
+            raw_url = item
+        elif "base64," in item:
+            b64 = item.split("base64,", 1)[1].strip()
+        else:
+            b64 = item
+    elif isinstance(item, dict):
+        for key in ("data", "b64_json"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                if value.startswith("data:") and "base64," in value:
+                    head, _, rest = value.partition("base64,")
+                    mime = head[5:].split(";")[0] or "image/png"
+                    b64 = rest.strip()
+                elif "://" in value:
+                    raw_url = value
+                elif "base64," in value:
+                    b64 = value.split("base64,", 1)[1].strip()
+                else:
+                    b64 = value
+                break
+        if b64 is None and raw_url is None:
+            image_url = item.get("image_url")
+            url = image_url if isinstance(image_url, str) else (image_url.get("url") if isinstance(image_url, dict) else None)
+            if isinstance(url, str) and url:
+                if url.startswith("data:") and "base64," in url:
+                    head, _, rest = url.partition("base64,")
+                    mime = head[5:].split(";")[0] or "image/png"
+                    b64 = rest.strip()
+                elif "://" in url:
+                    raw_url = url
+                elif "base64," in url:
+                    b64 = url.split("base64,", 1)[1].strip()
+                else:
+                    b64 = url
+
+    if raw_url:
+        return raw_url
+    if not b64:
+        return None
+    if b64.startswith("data:"):
+        return b64
+    return f"data:{mime};base64,{b64}"
+
+
+def _extract_first_image_data_uri(chunk: Dict[str, Any]) -> Optional[str]:
+    """从流式 delta 或非流式 message 中提取首张图片的完整 data URI。
+
+    兼容字段 `images`（复数）与 `image`（单数），并对多项取第一个可用。
+    """
+    for key in ("images", "image"):
+        items = chunk.get(key)
+        if isinstance(items, list) and items:
+            for item in items:
+                uri = _image_item_to_data_uri(item)
+                if uri:
+                    return uri
+    return None
+
+
+def _ensure_data_uri(value: str) -> str:
+    """确保返回值为完整的 data URI。
+
+    若值已带 `data:` 前缀或为普通 URL 则原样返回；否则按 image/png 补齐 base64 前缀。
+    """
+    if isinstance(value, str) and (value.startswith("data:") or "://" in value):
+        return value
+    return f"data:image/png;base64,{value}"
+
+
 async def generate_chat_response_with_image_support(
     model_group,
     messages: List[Dict[str, Any]],
@@ -281,7 +369,7 @@ async def generate_chat_response_with_image_support(
         max_wait_time: 最大等待时间
 
     Returns:
-        str: 图片 URL 或 base64 数据
+        str: 图片 URL 或 base64 data URI
 
     Raises:
         Exception: 当无法找到图片内容时
@@ -331,13 +419,11 @@ async def generate_chat_response_with_image_support(
 
                             delta = choices[0].get("delta", {})
 
-                            # 优先检查 image 字段
-                            image_data = delta.get("image")
-                            if image_data and isinstance(image_data, list) and image_data:
-                                # 取第一张图片的 base64 数据
-                                collected_image_data = image_data[0].get("data")
-                                if isinstance(collected_image_data, str):
-                                    logger.debug(f"找到 image 字段，数据长度: {len(collected_image_data)}")
+                            # 兼容 images(复数)/image(单数) 字段，提取第一张完整 data URI
+                            extracted = _extract_first_image_data_uri(delta)
+                            if extracted:
+                                collected_image_data = extracted
+                                logger.debug(f"找到图片字段，数据长度: {len(collected_image_data)}")
 
                             # 收集 content 内容作为备选
                             content_data = delta.get("content")
@@ -361,20 +447,20 @@ async def generate_chat_response_with_image_support(
             if choices:
                 message = choices[0].get("message", {})
 
-                # 检查是否有 image 字段
-                image_data = message.get("image")
-                if image_data and isinstance(image_data, list) and image_data:
-                    collected_image_data = image_data[0]
+                # 兼容 images(复数)/image(单数) 字段，提取第一张完整 data URI
+                extracted = _extract_first_image_data_uri(message)
+                if extracted:
+                    collected_image_data = extracted
 
                 # 收集 content 内容
                 content_data = message.get("content")
                 if content_data:
                     collected_content = content_data
 
-    # 优先返回 image 字段中的 base64 数据
+    # 优先返回图片字段中的 data URI 数据
     if collected_image_data:
-        logger.info("使用 image 字段中的 base64 数据")
-        return f"data:image/png;base64,{collected_image_data}"
+        logger.info("使用图片字段中的 data URI 数据")
+        return _ensure_data_uri(collected_image_data)
 
     # 回退到从 content 中提取图片信息
     if collected_content:
